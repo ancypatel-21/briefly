@@ -1,0 +1,275 @@
+// Briefly – Meeting Intelligence Platform
+// Data model for everything EXCEPT the LLM-powered layer (summarization,
+// action-item extraction, semantic search, contextual Q&A). Those fields
+// exist here already (MeetingSummary, ActionItem, etc.) but are populated
+// by deterministic stub generators for now — see src/lib/processing.ts.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Identity & teams
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  avatarColor  String   @default("#6366f1")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  teamMemberships    TeamMember[]
+  createdMeetings    Meeting[]            @relation("MeetingCreatedBy")
+  participations     MeetingParticipant[]
+  ownedActionItems   ActionItem[]         @relation("ActionItemOwner")
+  connectedIntegrations Integration[]     @relation("IntegrationConnectedBy")
+}
+
+model Team {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+
+  members      TeamMember[]
+  meetings     Meeting[]
+  integrations Integration[]
+}
+
+enum TeamRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+model TeamMember {
+  id       String   @id @default(cuid())
+  teamId   String
+  userId   String
+  role     TeamRole @default(MEMBER)
+  joinedAt DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+}
+
+// ---------------------------------------------------------------------------
+// Meetings
+// ---------------------------------------------------------------------------
+
+enum MeetingStatus {
+  SCHEDULED
+  LIVE
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model Meeting {
+  id          String        @id @default(cuid())
+  teamId      String
+  createdById String
+  title       String
+  description String?
+  status      MeetingStatus @default(SCHEDULED)
+  joinCode    String        @unique
+
+  scheduledStart DateTime?
+  scheduledEnd   DateTime?
+  startedAt      DateTime?
+  endedAt        DateTime?
+
+  recordingUrl         String?
+  recordingMimeType    String?
+  recordingDurationSec Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team        Team                 @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  createdBy   User                 @relation("MeetingCreatedBy", fields: [createdById], references: [id])
+  participants MeetingParticipant[]
+  speakers    Speaker[]
+  segments    TranscriptSegment[]
+  summary     MeetingSummary?
+  actionItems ActionItem[]
+  integrationActivity IntegrationActivity[]
+
+  @@index([teamId, status])
+  @@index([teamId, scheduledStart])
+}
+
+enum ParticipantRole {
+  HOST
+  PARTICIPANT
+}
+
+model MeetingParticipant {
+  id        String          @id @default(cuid())
+  meetingId String
+  userId    String?
+  name      String
+  email     String?
+  role      ParticipantRole @default(PARTICIPANT)
+  invitedAt DateTime        @default(now())
+  joinedAt  DateTime?
+
+  meeting Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  user    User?   @relation(fields: [userId], references: [id])
+
+  @@unique([meetingId, email])
+}
+
+// ---------------------------------------------------------------------------
+// Transcript & diarization
+//
+// Populated by src/lib/processing.ts. Today that's a deterministic stub;
+// swap it for a real speech-to-text + diarization engine later without
+// touching the schema.
+// ---------------------------------------------------------------------------
+
+model Speaker {
+  id          String  @id @default(cuid())
+  meetingId   String
+  label       String // e.g. "Speaker 1" — assigned by diarization
+  displayName String? // filled in once a human maps the label to a real name
+  color       String
+
+  meeting  Meeting              @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  segments TranscriptSegment[]
+
+  @@unique([meetingId, label])
+}
+
+model TranscriptSegment {
+  id        String  @id @default(cuid())
+  meetingId String
+  speakerId String
+  startMs   Int
+  endMs     Int
+  text      String
+  order     Int
+  isHighlight Boolean @default(false)
+
+  meeting Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  speaker Speaker @relation(fields: [speakerId], references: [id], onDelete: Cascade)
+
+  @@index([meetingId, order])
+}
+
+// ---------------------------------------------------------------------------
+// Meeting intelligence (structured summary + action items)
+//
+// generatedBy=STUB means the content was produced by the deterministic
+// placeholder generator, not a real model — swap in the LLM pipeline later
+// and flip generatedBy to LLM.
+// ---------------------------------------------------------------------------
+
+enum GeneratedBy {
+  STUB
+  LLM
+  HUMAN
+}
+
+model MeetingSummary {
+  id            String      @id @default(cuid())
+  meetingId     String      @unique
+  overview      String
+  keyDecisions  Json // string[]
+  openQuestions Json // string[]
+  nextSteps     Json // string[]
+  generatedBy   GeneratedBy @default(STUB)
+  generatedAt   DateTime    @default(now())
+
+  meeting Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+}
+
+enum ActionItemStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+}
+
+model ActionItem {
+  id          String           @id @default(cuid())
+  meetingId   String
+  description String
+  ownerUserId String?
+  ownerName   String?
+  dueDate     DateTime?
+  status      ActionItemStatus @default(PENDING)
+  generatedBy GeneratedBy      @default(STUB)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  meeting Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  owner   User?   @relation("ActionItemOwner", fields: [ownerUserId], references: [id])
+
+  @@index([meetingId])
+  @@index([ownerUserId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Integrations
+//
+// Connections + a framework for outbound actions (follow-up tasks, recaps).
+// The actual provider calls are stubbed in src/lib/integrations.ts — this
+// just records what "would" have happened, so the UI and data model are
+// ready to swap in real API calls later.
+// ---------------------------------------------------------------------------
+
+enum IntegrationProvider {
+  GOOGLE_CALENDAR
+  SLACK
+  NOTION
+  JIRA
+  LINEAR
+}
+
+enum IntegrationStatus {
+  CONNECTED
+  DISCONNECTED
+}
+
+model Integration {
+  id                    String            @id @default(cuid())
+  teamId                String
+  provider              IntegrationProvider
+  status                IntegrationStatus @default(DISCONNECTED)
+  externalAccountLabel  String? // e.g. mock workspace/site name entered on "connect"
+  connectedById         String?
+  connectedAt           DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  team        Team                  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  connectedBy User?                 @relation("IntegrationConnectedBy", fields: [connectedById], references: [id])
+  activity    IntegrationActivity[]
+
+  @@unique([teamId, provider])
+}
+
+model IntegrationActivity {
+  id            String   @id @default(cuid())
+  integrationId String
+  meetingId     String?
+  action        String // e.g. "sync_recap", "create_followup_task"
+  targetLabel   String // e.g. "#eng-standup" or "PROJ-123"
+  detail        String?
+  createdAt     DateTime @default(now())
+
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  meeting     Meeting?    @relation(fields: [meetingId], references: [id], onDelete: SetNull)
+
+  @@index([integrationId, createdAt])
+}
